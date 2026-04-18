@@ -17,7 +17,6 @@ class OwnerOrAdmin
             return response()->json(['message' => 'Unauthenticated'], 401);
         }
 
-        // Admin bypass
         if ($user->role === 'admin') {
             return $next($request);
         }
@@ -25,31 +24,32 @@ class OwnerOrAdmin
         $restaurant = $request->route('restaurant');
         $food = $request->route('food');
 
-        // 🔥 food route handling
+        // handle food route safely
         if ($food && !$restaurant) {
-            if ($food instanceof Food) {
+
+            if ($food instanceof \App\Models\Food) {
                 $restaurant = $food->restaurant;
             } else {
-                $foodModel = Food::find($food);
-                $restaurant = $foodModel?->restaurant;
+                $foodModel = \App\Models\Food::find($food);
+
+                if (!$foodModel) {
+                    return response()->json(['message' => 'Food not found'], 404);
+                }
+
+                $restaurant = $foodModel->restaurant;
             }
         }
 
         if (is_numeric($restaurant)) {
-            $restaurant = Restaurant::find($restaurant);
+            $restaurant = \App\Models\Restaurant::find($restaurant);
         }
 
         if (!$restaurant) {
-            return response()->json([
-                'message' => 'Restaurant not found'
-            ], 404);
+            return response()->json(['message' => 'Restaurant not found'], 404);
         }
 
-        // 🔥 FIX: null-safe check
-        if ((int)$user->id !== (int)($restaurant->owner_id ?? 0)) {
-            return response()->json([
-                'message' => 'Forbidden - owner only'
-            ], 403);
+        if ((int)$user->id !== (int)$restaurant->owner_id) {
+            return response()->json(['message' => 'Forbidden - owner only'], 403);
         }
 
         return $next($request);

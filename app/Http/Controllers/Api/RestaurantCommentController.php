@@ -22,11 +22,10 @@ class RestaurantCommentController extends Controller
         $imageName = null;
 
         if ($request->hasFile('image')) {
-            $imageName = time() . '_' . uniqid() . '.' . $request->image->extension();
-            $request->image->move(storage_path('app/public/comments'), $imageName);
+            $imageName = $request->file('image')->store('comments', 'public');
         }
 
-        $comment = RestaurantComment::create([
+        $comment = \App\Models\RestaurantComment::create([
             'user_id' => $request->user()->id,
             'restaurant_id' => $request->restaurant_id,
             'comment' => $request->comment,
@@ -38,7 +37,6 @@ class RestaurantCommentController extends Controller
             'comment' => $comment
         ]);
     }
-
     /**
      * Update comment
      */
@@ -49,7 +47,7 @@ class RestaurantCommentController extends Controller
             'image' => 'nullable|image|mimes:jpg,jpeg,png,webp|max:2048',
         ]);
 
-        $comment = RestaurantComment::findOrFail($id);
+        $comment = \App\Models\RestaurantComment::findOrFail($id);
 
         if ($comment->user_id !== $request->user()->id) {
             return response()->json([
@@ -57,21 +55,20 @@ class RestaurantCommentController extends Controller
             ], 403);
         }
 
-        $imageName = $comment->image;
-
+        // إذا في صورة جديدة
         if ($request->hasFile('image')) {
-            if ($comment->image && file_exists(public_path('comments/' . $comment->image))) {
-                unlink(public_path('comments/' . $comment->image));
+
+            // حذف القديمة
+            if ($comment->image) {
+                \Storage::disk('public')->delete($comment->image);
             }
 
-            $imageName = time() . '_' . uniqid() . '.' . $request->image->extension();
-            $request->image->move(public_path('comments'), $imageName);
+            // رفع الجديدة
+            $comment->image = $request->file('image')->store('comments', 'public');
         }
 
-        $comment->update([
-            'comment' => $request->comment,
-            'image' => $imageName,
-        ]);
+        $comment->comment = $request->comment;
+        $comment->save();
 
         return response()->json([
             'message' => 'تم تحديث التعليق',

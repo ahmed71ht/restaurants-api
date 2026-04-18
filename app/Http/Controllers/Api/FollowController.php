@@ -27,15 +27,21 @@ class FollowController extends Controller
      */
     public function follow(Restaurant $restaurant, Request $request)
     {
-        $request->user()
-            ->followedRestaurants()
-            ->syncWithoutDetaching($restaurant->id);
+        $user = $request->user();
+
+        $alreadyFollowing = $user->followedRestaurants()
+            ->where('restaurant_id', $restaurant->id)
+            ->exists();
+
+        if (!$alreadyFollowing) {
+            $user->followedRestaurants()->attach($restaurant->id);
+        }
 
         return response()->json([
             'message' => 'تمت المتابعة',
             'followed' => true
         ]);
-    }
+    }   
 
     /**
      * Unfollow restaurant

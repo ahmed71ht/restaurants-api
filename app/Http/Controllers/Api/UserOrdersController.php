@@ -67,27 +67,33 @@ class UserOrdersController extends Controller
             'quantity' => 'required|array',
         ]);
 
+        if (
+            count($request->order_food_id) !== count($request->food_id) ||
+            count($request->food_id) !== count($request->quantity)
+        ) {
+            return response()->json([
+                'message' => 'البيانات غير متطابقة'
+            ], 422);
+        }
+
         DB::beginTransaction();
 
         try {
 
             foreach ($request->order_food_id as $index => $pivot_id) {
 
-                $old = DB::table('order_food')
-                    ->where('id', $pivot_id)
-                    ->first();
+                $old = DB::table('order_food')->where('id', $pivot_id)->first();
 
-                if ($old) {
+                if (!$old) continue;
 
-                    DB::table('order_food')->where('id', $pivot_id)->delete();
+                DB::table('order_food')->where('id', $pivot_id)->delete();
 
-                    $newFood = Food::findOrFail($request->food_id[$index]);
+                $newFood = Food::findOrFail($request->food_id[$index]);
 
-                    $order->foods()->attach($newFood->id, [
-                        'quantity' => $request->quantity[$index],
-                        'price' => $newFood->price,
-                    ]);
-                }
+                $order->foods()->attach($newFood->id, [
+                    'quantity' => $request->quantity[$index],
+                    'price' => $newFood->price,
+                ]);
             }
 
             DB::commit();

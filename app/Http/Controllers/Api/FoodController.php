@@ -74,13 +74,12 @@ class FoodController extends Controller
     {
         $this->authorize('manage', $restaurant);
 
-        // ✅ FIX مهم
-        if ($food->restaurant_id !== $restaurant->id) {
+        if (!$food || $food->restaurant_id !== $restaurant->id) {
             return response()->json(['message' => 'غير موجود'], 404);
         }
 
         if ($food->image) {
-            Storage::disk('public')->delete($food->image);
+            \Storage::disk('public')->delete($food->image);
         }
 
         $food->delete();
