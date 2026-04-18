@@ -1,0 +1,1979 @@
+<?php
+
+use Illuminate\Support\Facades\Route;
+
+use App\Http\Controllers\Api\Auth\AuthController;
+use App\Http\Controllers\Api\ProfileController;
+use App\Http\Controllers\Api\RestaurantController;
+use App\Http\Controllers\Api\FoodController;
+use App\Http\Controllers\Api\OrderController;
+use App\Http\Controllers\Api\UserOrdersController;
+use App\Http\Controllers\Api\RestaurantCommentController;
+use App\Http\Controllers\Api\CommentReplyController;
+use App\Http\Controllers\Api\FollowController;
+use App\Http\Controllers\Api\DeliveryController;
+use App\Http\Controllers\Api\AdminController;
+
+/*
+|--------------------------------------------------------------------------
+| AUTH ROUTES
+|--------------------------------------------------------------------------
+*/
+
+Route::prefix('auth')->group(function () {
+
+    // register مع rate limit خفيف
+    Route::post('/register', [AuthController::class, 'register'])
+        ->middleware('throttle:10,1');
+
+    // login حماية ضد brute force
+    Route::post('/login', [AuthController::class, 'login'])
+        ->name('login')
+        ->middleware('throttle:login');
+
+    Route::middleware('auth:sanctum')->group(function () {
+        Route::post('/logout', [AuthController::class, 'logout']);
+        Route::delete('/me', [AuthController::class, 'deleteAccount']);
+    });
+});
+
+/*
+|--------------------------------------------------------------------------
+| PUBLIC ROUTES
+|--------------------------------------------------------------------------
+*/
+
+Route::get('/restaurants', [RestaurantController::class, 'index'])
+    ->middleware('throttle:api');
+
+Route::get('/restaurants/search', [RestaurantController::class, 'search'])
+    ->middleware('throttle:api');
+
+Route::get('/restaurants/{restaurant}', [RestaurantController::class, 'show'])
+    ->middleware('throttle:api');
+
+/*
+|--------------------------------------------------------------------------
+| PROTECTED ROUTES
+|--------------------------------------------------------------------------
+*/
+
+Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
+
+    /*
+    |-------------------------
+    | PROFILE
+    |-------------------------
+    */
+    Route::get('/profile', [ProfileController::class, 'show']);
+    Route::put('/profile', [ProfileController::class, 'update']);
+    Route::delete('/profile', [ProfileController::class, 'destroy']);
+
+    /*
+    |-------------------------
+    | FOLLOW
+    |-------------------------
+    */
+    Route::get('/restaurants/following', [FollowController::class, 'following']);
+    Route::post('/restaurants/{restaurant}/follow', [FollowController::class, 'follow']);
+    Route::delete('/restaurants/{restaurant}/unfollow', [FollowController::class, 'unfollow']);
+
+    /*
+    |-------------------------
+    | ORDERS (USER)
+    |-------------------------
+    */
+    Route::get('/restaurants/{restaurant}/my-orders', [UserOrdersController::class, 'userOrders']);
+    Route::get('/restaurants/{restaurant}/orders/{order}', [UserOrdersController::class, 'edit']);
+    Route::put('/restaurants/{restaurant}/orders/{order}', [UserOrdersController::class, 'update']);
+    Route::delete('/orders/{order}', [UserOrdersController::class, 'delete']);
+
+    /*
+    |-------------------------
+    | BUY / CHECKOUT
+    |-------------------------
+    */
+    Route::post('/foods/{food}/buy', [FoodController::class, 'buyStore'])
+        ->middleware('throttle:10,1');
+
+    // حماية قوية للـ checkout
+    Route::post('/checkout', [FoodController::class, 'checkout'])
+        ->middleware('throttle:3,1');
+
+    /*
+    |-------------------------
+    | COMMENTS
+    |-------------------------
+    */
+    Route::post('/comments', [RestaurantCommentController::class, 'store']);
+    Route::put('/comments/{id}', [RestaurantCommentController::class, 'update']);
+    Route::delete('/comments/{id}', [RestaurantCommentController::class, 'destroy']);
+
+    Route::post('/comments/{comment}/replies', [CommentReplyController::class, 'store']);
+    Route::put('/replies/{id}', [CommentReplyController::class, 'update']);
+    Route::delete('/replies/{id}', [CommentReplyController::class, 'destroy']);
+
+    /*
+    |-------------------------
+    | OWNER OR ADMIN
+    |-------------------------
+    */
+    Route::middleware('ownerOrAdmin')->group(function () {
+
+        Route::get('/restaurants/{restaurant}/orders', [OrderController::class, 'orders']);
+        Route::put('/restaurants/{restaurant}/orders/{order}/accept', [OrderController::class, 'acceptOrder']);
+        Route::put('/restaurants/{restaurant}/orders/{order}/reject', [OrderController::class, 'rejectOrder']);
+
+        // 🔥 تم تصحيح المسار
+        Route::delete('/admin/orders/rejected', [OrderController::class, 'deleteRejected']);
+
+        Route::post('/restaurants/{restaurant}/foods', [FoodController::class, 'store']);
+        Route::delete('/restaurants/{restaurant}/foods/{food}', [FoodController::class, 'destroy']);
+        Route::put('/foods/{food}', [FoodController::class, 'update']);
+    });
+
+    /*
+    |-------------------------
+    | DELIVERY OR ADMIN
+    |-------------------------
+    */
+    Route::middleware('deliveryOrAdmin')->group(function () {
+
+        Route::get('/restaurants/{restaurant}/delivery', [DeliveryController::class, 'index']);
+        Route::put('/restaurants/{restaurant}/delivery/{order}', [DeliveryController::class, 'updateStatus']);
+
+        // 🔥 تم إزالة restaurant param لأنه غير مستخدم
+        Route::delete('/delivery/delivered', [DeliveryController::class, 'deleteDelivered']);
+    });
+
+    /*
+    |-------------------------
+    | ADMIN ONLY
+    |-------------------------
+    */
+    Route::prefix('admin')->middleware('admin')->group(function () {
+
+        // Dashboard
+        Route::get('/dashboard', [AdminController::class, 'dashboard']);
+
+        // Restaurants
+        Route::post('/restaurants', [RestaurantController::class, 'store']);
+        Route::put('/restaurants/{restaurant}', [RestaurantController::class, 'update']);
+        Route::delete('/restaurants/{restaurant}', [RestaurantController::class, 'destroy']);
+
+        // Users
+        Route::get('/users', [AdminController::class, 'users']);
+        Route::put('/users/{id}', [AdminController::class, 'updateUser']);
+    });
+
+});
+
+==================================
+
+<?php
+
+namespace App\Http\Controllers\Api\Auth;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Models\User;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\Str;
+
+class AuthController extends Controller
+{
+    public function register(Request $request)
+    {
+        $validated = $request->validate([
+            'name' => 'required|string|max:255',
+            'email' => 'required|string|email|max:255|unique:users,email',
+            'password' => 'required|string|min:6',
+        ]);
+
+        $user = User::create([
+            'name' => $validated['name'],
+            'email' => $validated['email'],
+            'password' => Hash::make($validated['password']),
+        ]);
+
+        $token = $user->createToken('auth_token')->plainTextToken;
+
+        return response()->json([
+            'message' => 'تم إنشاء الحساب',
+            'token' => $token,
+            'user' => $user
+        ], 201);
+    }
+
+    public function login(Request $request)
+    {
+        $validated = $request->validate([
+            'email' => 'required|email',
+            'password' => 'required|string'
+        ]);
+
+        $user = User::where('email', $validated['email'])->first();
+
+        $key = 'login:' . $request->ip();
+
+        if (RateLimiter::tooManyAttempts($key, 5)) {
+            return response()->json([
+                'message' => 'تم حظر المحاولات مؤقتاً'
+            ], 429);
+        }
+
+        if (!$user || !Hash::check($validated['password'], $user->password)) {
+            RateLimiter::hit($key, 60);
+
+            return response()->json([
+                'message' => 'بيانات غير صحيحة'
+            ], 401);
+        }
+
+        RateLimiter::clear($key);
+
+        $user->currentAccessToken()->delete();
+
+        $token = $user->createToken('auth_token')->plainTextToken;
+
+        return response()->json([
+            'message' => 'تم تسجيل الدخول',
+            'token' => $token,
+            'user' => $user
+        ]);
+    }
+
+    public function logout(Request $request)
+    {
+        $request->user()?->currentAccessToken()?->delete();
+
+        return response()->json([
+            'message' => 'تم تسجيل الخروج'
+        ]);
+    }
+
+    public function deleteAccount(Request $request)
+    {
+        $user = $request->user();
+
+        $user->tokens()->delete();
+        $user->delete();
+
+        return response()->json([
+            'message' => 'تم حذف الحساب'
+        ]);
+    }
+}
+
+
+=========================================
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Restaurant;
+use App\Models\Food;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
+
+class AdminController extends Controller
+{
+    public function dashboard()
+    {
+        $restaurantsCount = Restaurant::count();
+        $foodsCount = Food::count();
+
+        $latestRestaurants = Restaurant::latest()->take(10)->get();
+        $latestFoods = Food::with('restaurant')->latest()->take(10)->get();
+
+        $foodsPerRestaurantRaw = DB::table('foods')
+            ->select('restaurant_id', DB::raw('count(*) as total'))
+            ->groupBy('restaurant_id')
+            ->orderByDesc('total')
+            ->take(10)
+            ->get();
+
+        $restaurants = Restaurant::whereIn(
+            'id',
+            $foodsPerRestaurantRaw->pluck('restaurant_id')
+        )->get()->keyBy('id');
+
+        $foodsPerRestaurant = $foodsPerRestaurantRaw->map(function ($row) use ($restaurants) {
+            return [
+                'restaurant_name' => $restaurants[$row->restaurant_id]->name ?? 'غير معروف',
+                'total' => $row->total,
+            ];
+        });
+
+        return response()->json([
+            'restaurants_count' => $restaurantsCount,
+            'foods_count' => $foodsCount,
+            'latest_restaurants' => $latestRestaurants,
+            'latest_foods' => $latestFoods,
+            'foods_per_restaurant' => $foodsPerRestaurant,
+        ]);
+    }
+
+    public function users()
+    {
+        return response()->json([
+            'users' => User::all()
+        ]);
+    }
+
+    public function updateUser(Request $request, $id)
+    {
+        $user = User::findOrFail($id);
+
+        $request->validate([
+            'name' => 'required|string',
+            'email' => 'required|email|unique:users,email,' . $id,
+            'role' => 'nullable|string',
+            'password' => 'nullable|min:6',
+        ]);
+
+        $user->update([
+            'name' => $request->name,
+            'email' => $request->email,
+            'role' => $request->role,
+            'password' => $request->password ? Hash::make($request->password) : $user->password,
+        ]);
+
+        return response()->json([
+            'message' => 'تم التحديث',
+            'user' => $user
+        ]);
+    }
+}
+
+==============================================
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\CommentReply;
+use Illuminate\Http\Request;
+
+class CommentReplyController extends Controller
+{
+    /**
+     * Store reply
+     */
+    public function store(Request $request, $commentId)
+    {
+        $request->validate([
+            'reply' => 'required|min:3',
+        ]);
+
+        $reply = CommentReply::create([
+            'user_id'    => $request->user()->id,
+            'comment_id' => $commentId,
+            'reply'      => $request->reply,
+        ]);
+
+        return response()->json([
+            'message' => 'تم إضافة الرد بنجاح',
+            'reply' => $reply
+        ]);
+    }
+
+    /**
+     * Update reply
+     */
+    public function update(Request $request, $id)
+    {
+        $request->validate([
+            'reply' => 'required|min:3',
+        ]);
+
+        $reply = CommentReply::findOrFail($id);
+
+        // فقط صاحب الرد
+        if ($reply->user_id !== $request->user()->id) {
+            return response()->json([
+                'message' => 'غير مسموح'
+            ], 403);
+        }
+
+        $reply->update([
+            'reply' => $request->reply
+        ]);
+
+        return response()->json([
+            'message' => 'تم تعديل الرد بنجاح',
+            'reply' => $reply
+        ]);
+    }
+
+    /**
+     * Delete reply
+     */
+    public function destroy(Request $request, $id)
+    {
+        $reply = CommentReply::findOrFail($id);
+
+        $user = $request->user();
+
+        $restaurantOwnerId = optional($reply->comment?->restaurant)->owner_id;
+
+        if (
+            $reply->user_id !== $user->id &&
+            $user->role !== 'admin' &&
+            $user->id !== $restaurantOwnerId
+        ) {
+            return response()->json([
+                'message' => 'غير مسموح بحذف الرد'
+            ], 403);
+        }
+
+        $reply->delete();
+
+        return response()->json([
+            'message' => 'تم حذف الرد'
+        ]);
+    }
+}
+
+
+=========================================
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Order;
+use App\Models\Restaurant;
+use Illuminate\Http\Request;
+
+class DeliveryController extends Controller
+{
+    /**
+     * Get delivery orders for restaurant
+     */
+    public function index(Restaurant $restaurant)
+    {
+        $orders = $restaurant->orders()
+            ->with(['foods', 'customer'])
+            ->where('status', 'accepted')
+            ->whereNotNull('delivery_status')
+            ->latest()
+            ->get();
+
+        return response()->json([
+            'restaurant' => $restaurant,
+            'orders' => $orders
+        ]);
+    }
+
+    /**
+     * Update delivery status
+     */
+    public function updateStatus(Request $request, Restaurant $restaurant, Order $order)
+    {
+        $user = $request->user();
+
+        if (!$user || ($user->role !== 'admin' && $user->id !== $restaurant->owner_id)) {
+            return response()->json([
+                'message' => 'ليس لديك صلاحية'
+            ], 403);
+        }
+
+        // تأكد إن الطلب تابع لنفس المطعم
+        if ($order->restaurant_id !== $restaurant->id) {
+            return response()->json([
+                'message' => 'الطلب غير تابع لهذا المطعم'
+            ], 404);
+        }
+
+        $request->validate([
+            'delivery_status' => 'required|in:pending_delivery,on_the_way,delivered'
+        ]);
+
+        $order->update([
+            'delivery_status' => $request->delivery_status
+        ]);
+
+        return response()->json([
+            'message' => 'تم تحديث حالة التوصيل',
+            'order' => $order
+        ], 200);
+    }
+
+    /**
+     * Delete delivered orders
+     */
+    public function deleteDelivered(Request $request)
+    {
+        $user = $request->user();
+
+        // فقط الادمن
+        if (!$user || $user->role !== 'admin') {
+            return response()->json([
+                'message' => 'غير مصرح'
+            ], 403);
+        }
+
+        $deleted = Order::where('delivery_status', 'delivered')->delete();
+
+        return response()->json([
+            'message' => 'تم حذف الطلبات الموصلة',
+            'deleted_count' => $deleted
+        ], 200);
+    }
+}
+
+============================================
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Restaurant;
+use Illuminate\Http\Request;
+
+class FollowController extends Controller
+{
+    /**
+     * Get followed restaurants
+     */
+    public function following(Request $request)
+    {
+        $restaurants = $request->user()
+            ->followedRestaurants()
+            ->get();
+
+        return response()->json([
+            'restaurants' => $restaurants
+        ]);
+    }
+
+    /**
+     * Follow restaurant
+     */
+    public function follow(Restaurant $restaurant, Request $request)
+    {
+        $request->user()
+            ->followedRestaurants()
+            ->syncWithoutDetaching($restaurant->id);
+
+        return response()->json([
+            'message' => 'تمت المتابعة',
+            'followed' => true
+        ]);
+    }
+
+    /**
+     * Unfollow restaurant
+     */
+    public function unfollow(Restaurant $restaurant, Request $request)
+    {
+        $request->user()
+            ->followedRestaurants()
+            ->detach($restaurant->id);
+
+        return response()->json([
+            'message' => 'تم إلغاء المتابعة',
+            'followed' => false
+        ]);
+    }
+}
+
+===================================
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Restaurant;
+use App\Models\Food;
+use Illuminate\Http\Request;
+use App\Services\FoodService;
+use Illuminate\Support\Facades\Storage;
+
+class FoodController extends Controller
+{
+    protected $foodService;
+
+    public function __construct(FoodService $foodService)
+    {
+        $this->foodService = $foodService;
+    }
+
+    public function store(Request $request, Restaurant $restaurant)
+    {
+        $this->authorize('manage', $restaurant);
+
+        $request->validate([
+            'name' => 'required|string',
+            'description' => 'nullable|string',
+            'image' => 'required|image',
+            'price' => 'required|numeric',
+        ]);
+
+        $data = $request->only(['name', 'description', 'price']);
+
+        $data['image'] = $request->file('image')->store('foods', 'public');
+
+        $food = $this->foodService->create($restaurant, $data);
+
+        return response()->json([
+            'message' => 'تم إضافة الأكلة',
+            'food' => $food
+        ]);
+    }
+
+    public function update(Request $request, Food $food)
+    {
+        $this->authorize('manage', $food->restaurant);
+
+        $request->validate([
+            'name' => 'required|string',
+            'description' => 'nullable|string',
+            'price' => 'nullable|numeric',
+            'image' => 'nullable|image',
+        ]);
+
+        $data = $request->only(['name', 'description', 'price']);
+
+        if ($request->hasFile('image')) {
+            if ($food->image) {
+                Storage::disk('public')->delete($food->image);
+            }
+
+            $data['image'] = $request->file('image')->store('foods', 'public');
+        }
+
+        $food = $this->foodService->update($food, $data);
+
+        return response()->json([
+            'message' => 'تم تحديث الأكلة',
+            'food' => $food
+        ]);
+    }
+
+    public function destroy(Restaurant $restaurant, Food $food)
+    {
+        $this->authorize('manage', $restaurant);
+
+        if ($food->image) {
+            Storage::disk('public')->delete($food->image);
+        }
+
+        $food->delete();
+
+        return response()->json([
+            'message' => 'تم حذف الأكلة'
+        ]);
+    }
+}
+
+=================================================
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Order;
+use App\Models\Restaurant;
+use Illuminate\Http\Request;
+use App\Services\OrderService;
+
+class OrderController extends Controller
+{
+    protected $orderService;
+
+    public function __construct(OrderService $orderService)
+    {
+        $this->orderService = $orderService;
+    }
+
+    /**
+     * Get restaurant orders
+     */
+    public function orders(Restaurant $restaurant)
+    {
+        $this->authorize('manage', $restaurant);
+
+        $orders = $restaurant->orders()
+            ->with(['foods', 'customer'])
+            ->latest()
+            ->get();
+
+        return response()->json([
+            'restaurant' => $restaurant,
+            'orders' => $orders
+        ]);
+    }
+
+    /**
+     * Accept order
+     */
+    public function acceptOrder(Restaurant $restaurant, Order $order)
+    {
+        $this->authorize('manage', $restaurant);
+
+        try {
+            $order = $this->orderService->accept($restaurant, $order);
+
+            return response()->json([
+                'message' => 'تم قبول الطلب',
+                'order' => $order
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'message' => $e->getMessage()
+            ], 400);
+        }
+    }
+
+    /**
+     * Reject order
+     */
+    public function rejectOrder(Restaurant $restaurant, Order $order)
+    {
+        $this->authorize('manage', $restaurant);
+
+        try {
+            $order = $this->orderService->reject($restaurant, $order);
+
+            return response()->json([
+                'message' => 'تم رفض الطلب',
+                'order' => $order
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'message' => $e->getMessage()
+            ], 400);
+        }
+    }
+
+    /**
+     * Delete rejected orders (ADMIN ONLY)
+     */
+    public function deleteRejected()
+    {
+        if (auth()->user()->role !== 'admin') {
+            return response()->json([
+                'message' => 'غير مصرح'
+            ], 403);
+        }
+
+        $deleted = Order::where('status', 'rejected')->delete();
+
+        return response()->json([
+            'message' => 'تم حذف الطلبات المرفوضة',
+            'deleted_count' => $deleted
+        ]);
+    }
+}
+
+=============================
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Hash;
+
+class ProfileController extends Controller
+{
+    /**
+     * Get profile
+     */
+    public function show(Request $request)
+    {
+        return response()->json([
+            'user' => $request->user()
+        ]);
+    }
+
+    /**
+     * Update profile
+     */
+    public function update(Request $request)
+    {
+        $request->validate([
+            'name' => 'required|string|max:255',
+            'email' => 'required|email|max:255|unique:users,email,' . $request->user()->id,
+        ]);
+
+        $user = $request->user();
+
+        $oldEmail = $user->email;
+
+        $user->name = $request->name;
+        $user->email = $request->email;
+
+        // إذا تغير الإيميل → يحتاج إعادة تحقق
+        if ($oldEmail !== $request->email) {
+            $user->email_verified_at = null;
+        }
+
+        $user->save();
+
+        return response()->json([
+            'message' => 'تم تحديث الملف الشخصي',
+            'user' => $user
+        ]);
+    }
+
+    /**
+     * Delete account
+     */
+    public function destroy(Request $request)
+    {
+        $request->validate([
+            'password' => ['required', 'current_password'],
+        ]);
+
+        $user = $request->user();
+
+        // حذف التوكنات (Sanctum)
+        $user->tokens()->delete();
+
+        $user->delete();
+
+        return response()->json([
+            'message' => 'تم حذف الحساب بنجاح'
+        ]);
+    }
+}
+
+=================================
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\RestaurantComment;
+use Illuminate\Http\Request;
+
+class RestaurantCommentController extends Controller
+{
+    /**
+     * Store comment
+     */
+    public function store(Request $request)
+    {
+        $request->validate([
+            'comment' => 'required|min:3',
+            'restaurant_id' => 'required|exists:restaurants,id',
+            'image' => 'nullable|image|mimes:jpg,jpeg,png,webp|max:2048',
+        ]);
+
+        $imageName = null;
+
+        if ($request->hasFile('image')) {
+            $imageName = time() . '_' . uniqid() . '.' . $request->image->extension();
+            $request->image->move(storage_path('app/public/comments'), $imageName);
+        }
+
+        $comment = RestaurantComment::create([
+            'user_id' => $request->user()->id,
+            'restaurant_id' => $request->restaurant_id,
+            'comment' => $request->comment,
+            'image' => $imageName,
+        ]);
+
+        return response()->json([
+            'message' => 'تم إضافة التعليق بنجاح',
+            'comment' => $comment
+        ]);
+    }
+
+    /**
+     * Update comment
+     */
+    public function update(Request $request, $id)
+    {
+        $request->validate([
+            'comment' => 'required|min:3',
+            'image' => 'nullable|image|mimes:jpg,jpeg,png,webp|max:2048',
+        ]);
+
+        $comment = RestaurantComment::findOrFail($id);
+
+        if ($comment->user_id !== $request->user()->id) {
+            return response()->json([
+                'message' => 'غير مسموح'
+            ], 403);
+        }
+
+        $imageName = $comment->image;
+
+        if ($request->hasFile('image')) {
+            if ($comment->image && file_exists(public_path('comments/' . $comment->image))) {
+                unlink(public_path('comments/' . $comment->image));
+            }
+
+            $imageName = time() . '_' . uniqid() . '.' . $request->image->extension();
+            $request->image->move(public_path('comments'), $imageName);
+        }
+
+        $comment->update([
+            'comment' => $request->comment,
+            'image' => $imageName,
+        ]);
+
+        return response()->json([
+            'message' => 'تم تحديث التعليق',
+            'comment' => $comment
+        ]);
+    }
+
+    /**
+     * Delete comment
+     */
+    public function destroy($id, Request $request)
+    {
+        $comment = RestaurantComment::findOrFail($id);
+
+        $restaurantOwnerId = $comment->restaurant->owner_id;
+        $user = $request->user();
+
+        if (
+            $comment->user_id !== $user->id &&
+            $user->role !== 'admin' &&
+            $user->id !== $restaurantOwnerId
+        ) {
+            return response()->json([
+                'message' => 'غير مسموح بحذف التعليق'
+            ], 403);
+        }
+
+        if ($comment->image && file_exists(public_path('comments/' . $comment->image))) {
+            unlink(public_path('comments/' . $comment->image));
+        }
+
+        $comment->delete();
+
+        return response()->json([
+            'message' => 'تم حذف التعليق'
+        ]);
+    }
+}
+
+=====================================
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Restaurant;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+
+class RestaurantController extends Controller
+{
+    /**
+     * Get all restaurants
+     */
+    public function index()
+    {
+        $restaurants = Cache::remember('restaurants_all', 60, function () {
+            return Restaurant::with('owner')->get();
+        });
+
+        return response()->json([
+            'restaurants' => $restaurants
+        ]);
+    }
+
+    /**
+     * Show restaurant
+     */
+    public function show(Restaurant $restaurant)
+    {
+        $data = Cache::remember("restaurant_{$restaurant->id}", 60, function () use ($restaurant) {
+            return $restaurant->load(['foods', 'owner']);
+        });
+
+        return response()->json([
+            'restaurant' => $data
+        ]);
+    }
+
+    /**
+     * Create restaurant
+     */
+    public function store(Request $request)
+    {
+        $request->validate([
+            'delivery_id' => 'required|exists:users,id',
+            'name' => 'required|string',
+            'description' => 'nullable|string',
+            'image' => 'required|image|mimes:jpg,jpeg,png,webp|max:2048',
+            'phone' => 'required|string',
+            'location' => 'required|string',
+        ]);
+
+        $data = $request->only([
+            'delivery_id',
+            'name',
+            'description',
+            'phone',
+            'location'
+        ]);
+
+        // FIX: منع تزوير owner_id
+        $data['owner_id'] = $request->user()->id;
+
+        if ($request->hasFile('image')) {
+            $file = $request->file('image');
+            $name = time() . '_' . $file->getClientOriginalName();
+            $file->move(public_path('restaurantImg'), $name);
+            $data['image'] = 'restaurantImg/' . $name;
+        }
+
+        $restaurant = Restaurant::create($data);
+
+        return response()->json([
+            'message' => 'تم إنشاء المطعم',
+            'restaurant' => $restaurant
+        ]);
+    }
+    /**
+     * Update restaurant
+     */
+    public function update(Request $request, Restaurant $restaurant)
+    {
+        $request->validate([
+            'name' => 'required|string|max:255',
+            'location' => 'nullable|string',
+        ]);
+
+        $restaurant->update($request->only('name', 'location'));
+
+        Cache::forget("restaurant_{$restaurant->id}");
+        Cache::forget("restaurants_all");
+        
+        return response()->json([
+            'message' => 'تم تحديث المطعم',
+            'restaurant' => $restaurant
+        ]);
+    }
+
+    /**
+     * Delete restaurant
+     */
+    public function destroy(Restaurant $restaurant)
+    {
+        if ($restaurant->image && file_exists(public_path($restaurant->image))) {
+            unlink(public_path($restaurant->image));
+        }
+
+        $restaurant->delete();
+
+        return response()->json([
+            'message' => 'تم حذف المطعم'
+        ]);
+    }
+
+    /**
+     * Search restaurants
+     */
+    public function search(Request $request)
+    {
+        $query = $request->input('query');
+
+        $restaurants = Restaurant::query()
+            ->where('name', 'LIKE', "%{$query}%")
+            ->get();
+
+        return response()->json([
+            'restaurants' => $restaurants
+        ]);
+    }
+
+    /**
+     * Create restaurant (create view removed)
+     */
+    public function create()
+    {
+        return response()->json([
+            'users' => User::all()
+        ]);
+    }
+}
+
+=====================================
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Restaurant;
+use App\Models\Order;
+use App\Models\Food;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+
+class UserOrdersController extends Controller
+{
+    /**
+     * Get user orders for restaurant
+     */
+    public function userOrders(Restaurant $restaurant, Request $request)
+    {
+        $orders = $restaurant->orders()
+            ->where('customer_id', $request->user()->id)
+            ->with('foods', 'customer')
+            ->latest()
+            ->get();
+
+        return response()->json([
+            'orders' => $orders
+        ]);
+    }
+
+    /**
+     * Show order
+     */
+    public function edit(Restaurant $restaurant, Order $order, Request $request)
+    {
+        if ($order->customer_id != $request->user()->id) {
+            return response()->json([
+                'message' => 'غير مسموح'
+            ], 403);
+        }
+
+        $order->load(['foods' => function ($q) {
+            $q->withPivot('id', 'quantity', 'price');
+        }]);
+
+        return response()->json([
+            'order' => $order
+        ]);
+    }
+
+    /**
+     * Update order (items + quantity)
+     */
+    public function update(Request $request, Restaurant $restaurant, Order $order)
+    {
+        if (
+            $order->customer_id != $request->user()->id ||
+            $order->status === 'accepted'
+        ) {
+            return response()->json([
+                'message' => 'لا يمكنك تعديل هذا الطلب'
+            ], 403);
+        }
+
+        $request->validate([
+            'order_food_id' => 'required|array',
+            'food_id' => 'required|array',
+            'quantity' => 'required|array',
+        ]);
+
+        DB::beginTransaction();
+
+        try {
+
+            foreach ($request->order_food_id as $index => $pivot_id) {
+
+                $old = DB::table('order_food')
+                    ->where('id', $pivot_id)
+                    ->first();
+
+                if ($old) {
+
+                    DB::table('order_food')->where('id', $pivot_id)->delete();
+
+                    $newFood = Food::findOrFail($request->food_id[$index]);
+
+                    $order->foods()->attach($newFood->id, [
+                        'quantity' => $request->quantity[$index],
+                        'price' => $newFood->price,
+                    ]);
+                }
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'message' => 'تم تحديث الطلب بنجاح',
+                'order' => $order->load('foods')
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+
+            return response()->json([
+                'message' => 'حدث خطأ'
+            ], 500);
+        }
+    }
+
+    /**
+     * Delete order
+     */
+    public function delete(Restaurant $restaurant, Order $order, Request $request)
+    {
+        if (
+            $order->customer_id != $request->user()->id ||
+            $order->status === 'accepted'
+        ) {
+            return response()->json([
+                'message' => 'لا يمكنك حذف هذا الطلب'
+            ], 403);
+        }
+
+        $order->delete();
+
+        return response()->json([
+            'message' => 'تم حذف الطلب'
+        ]);
+    }
+}
+
+============================================
+
+<?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+
+class AdminMiddleware
+{
+    public function handle(Request $request, Closure $next)
+    {
+        if (!$request->user()) {
+            return response()->json([
+                'message' => 'Unauthenticated'
+            ], 401);
+        }
+
+        if ($request->user()->role !== 'admin') {
+            return response()->json([
+                'message' => 'Access denied (admin only)'
+            ], 403);
+        }
+
+        return $next($request);
+    }
+}
+
+============================================
+
+<?php
+
+namespace App\Http\Middleware;
+
+use Illuminate\Auth\Middleware\Authenticate as Middleware;
+
+class Authenticate extends Middleware
+{
+    protected function redirectTo($request)
+    {
+        return null; // API only
+    }
+}
+
+=======================================
+
+<?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use App\Models\Restaurant;
+
+class DeliveryOrAdmin
+{
+    public function handle(Request $request, Closure $next)
+    {
+        $user = $request->user();
+
+        if (!$user) {
+            return response()->json(['message' => 'Unauthenticated'], 401);
+        }
+
+        // Admin bypass
+        if ($user->role === 'admin') {
+            return $next($request);
+        }
+
+        $restaurant = $request->route('restaurant');
+
+        if (is_numeric($restaurant)) {
+            $restaurant = Restaurant::find($restaurant);
+        }
+
+        if (!$restaurant) {
+            return response()->json(['message' => 'Restaurant not found'], 404);
+        }
+
+        // 🔥 FIX: حماية من null delivery_id
+        if ((int)$user->id !== (int)($restaurant->delivery_id ?? 0)) {
+            return response()->json([
+                'message' => 'Forbidden - delivery only'
+            ], 403);
+        }
+
+        return $next($request);
+    }
+}
+
+=======================================
+
+<?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use App\Models\Restaurant;
+use App\Models\Food;
+
+class OwnerOrAdmin
+{
+    public function handle(Request $request, Closure $next)
+    {
+        $user = $request->user();
+
+        if (!$user) {
+            return response()->json(['message' => 'Unauthenticated'], 401);
+        }
+
+        // Admin bypass
+        if ($user->role === 'admin') {
+            return $next($request);
+        }
+
+        $restaurant = $request->route('restaurant');
+        $food = $request->route('food');
+
+        // 🔥 food route handling
+        if ($food && !$restaurant) {
+            if ($food instanceof Food) {
+                $restaurant = $food->restaurant;
+            } else {
+                $foodModel = Food::find($food);
+                $restaurant = $foodModel?->restaurant;
+            }
+        }
+
+        if (is_numeric($restaurant)) {
+            $restaurant = Restaurant::find($restaurant);
+        }
+
+        if (!$restaurant) {
+            return response()->json([
+                'message' => 'Restaurant not found'
+            ], 404);
+        }
+
+        // 🔥 FIX: null-safe check
+        if ((int)$user->id !== (int)($restaurant->owner_id ?? 0)) {
+            return response()->json([
+                'message' => 'Forbidden - owner only'
+            ], 403);
+        }
+
+        return $next($request);
+    }
+}
+
+=======================================
+
+<?php
+
+namespace App\Jobs;
+
+use App\Models\Food;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+
+class SendNewDishNotification implements ShouldQueue
+{
+    use Dispatchable, Queueable;
+
+    protected $food;
+
+    public function __construct(Food $food)
+    {
+        $this->food = $food;
+    }
+
+    public function handle()
+    {
+        $restaurant = $this->food->restaurant;
+
+        foreach ($restaurant->followers as $follower) {
+            $follower->notify(new \App\Notifications\NewDishEmail($this->food));
+        }
+    }
+}
+
+=====================================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class CommentReply extends Model
+{
+    protected $fillable = [
+        'comment_id',
+        'user_id',
+        'reply',
+    ];
+
+    public function comment()
+    {
+        return $this->belongsTo(RestaurantComment::class, 'comment_id');
+    }
+
+
+    public function user()
+    {
+        return $this->belongsTo(User::class);
+    }
+}
+
+============================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class Delivery extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'order_id', 'delivery_man_id', 'status', 'delivered_at'
+    ];
+
+    // الطلب
+    public function order()
+    {
+        return $this->belongsTo(Order::class);
+    }
+
+    // عامل التوصيل
+    public function deliveryMan()
+    {
+        return $this->belongsTo(User::class, 'delivery_man_id');
+    }
+}
+
+====================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class Food extends Model
+{
+    use HasFactory;
+
+    protected $table = 'foods';
+
+    protected $fillable = [
+        'restaurant_id',
+        'name',
+        'description',
+        'price',
+        'image'
+    ];
+
+    public function restaurant()
+    {
+        return $this->belongsTo(Restaurant::class);
+    }
+
+    // 🔥 توحيد pivot مع Order
+    public function orders()
+    {
+        return $this->belongsToMany(Order::class, 'order_food')
+            ->withPivot('quantity', 'price')
+            ->withTimestamps();
+    }
+}
+
+============================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class Message extends Model
+{
+    use HasFactory;
+
+    protected $fillable = ['user_id', 'message'];
+
+    public function user()
+    {
+        return $this->belongsTo(User::class);
+    }
+}
+
+
+============================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class Order extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'customer_id',
+        'restaurant_id',
+        'status',
+        'delivery_status',
+        'total_price',
+        'location',
+        'phone',
+    ];
+
+    // الزبون
+    public function customer()
+    {
+        return $this->belongsTo(User::class, 'customer_id');
+    }
+
+    // المطعم
+    public function restaurant()
+    {
+        return $this->belongsTo(Restaurant::class);
+    }
+
+    // الأصناف الموجودة بالطلب
+    public function foods()
+    {
+        return $this->belongsToMany(Food::class, 'order_food')
+                    ->withPivot('quantity', 'price');
+    }
+
+    // التوصيل المرتبط بالطلب
+    public function delivery()
+    {
+        return $this->hasOne(Delivery::class);
+    }
+
+    public function items()
+    {
+        return $this->hasMany(OrderItem::class);
+    }
+
+}
+
+========================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class Restaurant extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'owner_id',
+        'delivery_id',
+        'name',
+        'description',
+        'image',
+        'phone',
+        'location',
+    ];
+
+    public function owner()
+    {
+        return $this->belongsTo(User::class, 'owner_id');
+    }
+
+    // 🔥 كان ناقص
+    public function deliveryMan()
+    {
+        return $this->belongsTo(User::class, 'delivery_id');
+    }
+
+    public function foods()
+    {
+        return $this->hasMany(Food::class);
+    }
+
+    public function orders()
+    {
+        return $this->hasMany(Order::class);
+    }
+
+    public function comments()
+    {
+        return $this->hasMany(RestaurantComment::class);
+    }
+
+    public function followers()
+    {
+        return $this->belongsToMany(User::class, 'restaurant_followers');
+    }
+}
+
+=======================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class RestaurantComment extends Model
+{
+    protected $fillable = [
+        'restaurant_id',
+        'user_id',
+        'comment',
+        'rating',
+        'image',
+    ];
+
+    public function user()
+    {
+        return $this->belongsTo(User::class);
+    }
+
+    public function restaurant()
+    {
+        return $this->belongsTo(Restaurant::class);
+    }
+
+    public function isRestaurantOwner()
+    {
+        return optional($this->restaurant)->owner_id === $this->user_id;
+    }
+
+    public function replies()
+    {
+        return $this->hasMany(CommentReply::class, 'comment_id');
+    }
+}
+
+===================================
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Foundation\Auth\User as Authenticatable;
+use Illuminate\Notifications\Notifiable;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Laravel\Sanctum\HasApiTokens;
+
+class User extends Authenticatable
+{
+    use HasApiTokens, HasFactory, Notifiable;
+
+    protected $fillable = [
+        'name', 'email', 'role', 'password', 'email_verified_at'
+    ];
+
+    protected $hidden = [
+        'password',
+    ];
+
+    public function restaurants()
+    {
+        return $this->hasMany(Restaurant::class, 'owner_id');
+    }
+
+    public function orders()
+    {
+        return $this->hasMany(Order::class, 'customer_id');
+    }
+
+    // خليتها بس إذا رح تستخدمها فعلاً
+    public function deliveries()
+    {
+        return $this->hasMany(Delivery::class, 'delivery_man_id');
+    }
+
+    public function followedRestaurants()
+    {
+        return $this->belongsToMany(Restaurant::class, 'restaurant_followers');
+    }
+}
+
+========================================================
+
+<?php
+
+namespace App\Policies;
+
+use App\Models\User;
+use App\Models\Restaurant;
+
+class RestaurantPolicy
+{
+    public function manage(User $user, Restaurant $restaurant)
+    {
+        return $user->role === 'admin' || $user->id === $restaurant->owner_id;
+    }
+}
+
+=========================================
+
+<?php
+
+namespace App\Providers;
+
+use Illuminate\Support\ServiceProvider;
+
+class AppServiceProvider extends ServiceProvider
+{
+    public function register(): void
+    {
+        //
+    }
+
+    public function boot(): void
+    {
+        // فقط إذا عندك Blade frontend
+    }
+}
+
+==========================================
+
+<?php
+
+namespace App\Providers;
+
+use Illuminate\Foundation\Support\Providers\AuthServiceProvider as ServiceProvider;
+use Illuminate\Support\Facades\Gate;
+
+class AuthServiceProvider extends ServiceProvider
+{
+    protected $policies = [
+        \App\Models\Restaurant::class => \App\Policies\RestaurantPolicy::class,
+    ];
+
+    /**
+     * Bootstrap any authentication / authorization services.
+     */
+    public function boot(): void
+    {
+        //
+    }
+
+}
+
+
+==================================================
+
+<?php
+
+namespace App\Providers;
+
+use Illuminate\Foundation\Support\Providers\RouteServiceProvider as ServiceProvider;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Http\Request;
+
+class RouteServiceProvider extends ServiceProvider
+{
+    public function boot()
+    {
+        RateLimiter::for('login', function (Request $request) {
+            return Limit::perMinute(5)->by($request->ip());
+        });
+
+        RateLimiter::for('api', function (Request $request) {
+            return Limit::perMinute(60)->by(
+                $request->user()?->id ?: $request->ip()
+            );
+        });
+    }
+}
+
+
+==============================================
+
+<?php
+
+namespace App\Services;
+
+use App\Models\Food;
+use App\Models\Restaurant;
+
+class FoodService
+{
+    public function create(Restaurant $restaurant, array $data)
+    {
+        $data['restaurant_id'] = $restaurant->id;
+        return Food::create($data);
+    }
+
+    public function update(Food $food, array $data)
+    {
+        $food->update($data);
+        return $food;
+    }
+}
+
+===============================================
+
+<?php
+
+namespace App\Services;
+
+use App\Models\Order;
+use App\Models\Restaurant;
+
+class OrderService
+{
+    public function accept(Restaurant $restaurant, Order $order)
+    {
+        if ($order->status === 'accepted') {
+            throw new \Exception('الطلب مقبول مسبقاً');
+        }
+
+        if ($order->restaurant_id !== $restaurant->id) {
+            throw new \Exception('الطلب غير تابع لهذا المطعم');
+        }
+
+        $order->update(['status' => 'accepted']);
+        $restaurant->increment('orders_count');
+
+        $order->load('foods');
+
+        foreach ($order->foods as $food) {
+            $food->increment('buyers_count');
+        }
+
+        return $order;
+    }
+
+    public function reject(Restaurant $restaurant, Order $order)
+    {
+        if ($order->restaurant_id !== $restaurant->id) {
+            throw new \Exception('الطلب غير تابع لهذا المطعم');
+        }
+
+        $order->update(['status' => 'rejected']);
+
+        return $order;
+    }
+}
+
+==========================================
+
+
+
+
+
+
+
+
+
+
+APP_NAME=restaurants-api-main
+APP_ENV=local
+APP_KEY=base64:Wif8A5Aw/3o6aNTdz0I4tirsiF4gP3yuOX+BSLy/C0A=
+APP_DEBUG=true
+APP_URL=http://127.0.0.1:8000
+
+APP_LOCALE=en
+APP_FALLBACK_LOCALE=en
+APP_FAKER_LOCALE=en_US
+
+APP_MAINTENANCE_DRIVER=file
+# APP_MAINTENANCE_STORE=database
+
+# PHP_CLI_SERVER_WORKERS=4
+
+BCRYPT_ROUNDS=12
+
+LOG_CHANNEL=stack
+LOG_STACK=single
+LOG_DEPRECATIONS_CHANNEL=null
+LOG_LEVEL=debug
+
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=restaurants-api-main
+DB_USERNAME=root
+DB_PASSWORD=
+
+SESSION_DRIVER=file
+SESSION_LIFETIME=120
+SESSION_ENCRYPT=false
+SESSION_PATH=/
+SESSION_DOMAIN=null
+
+BROADCAST_CONNECTION=log
+FILESYSTEM_DISK=local
+QUEUE_CONNECTION=database
+
+CACHE_STORE=file
+# CACHE_PREFIX=
+
+MEMCACHED_HOST=127.0.0.1
+
+REDIS_CLIENT=phpredis
+REDIS_HOST=127.0.0.1
+REDIS_PASSWORD=null
+REDIS_PORT=6379
+
+MAIL_MAILER=smtp
+MAIL_HOST=smtp.gmail.com
+MAIL_PORT=587
+MAIL_USERNAME=asdfghjklmnbv346@gmail.com
+MAIL_PASSWORD="hiap tayp bkfx jejc"
+MAIL_ENCRYPTION=tls
+MAIL_FROM_ADDRESS=asdfghjklmnbv346@gmail.com
+MAIL_FROM_NAME="Ahmed App"
+
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_DEFAULT_REGION=us-east-1
+AWS_BUCKET=
+AWS_USE_PATH_STYLE_ENDPOINT=false
+
+VITE_APP_NAME="${APP_NAME}"
