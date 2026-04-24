@@ -31,6 +31,9 @@ Route::prefix('auth')->group(function () {
         ->name('login')
         ->middleware('throttle:5,1');
 
+    Route::post('/verify-otp', [AuthController::class, 'verifyOtp']);
+    Route::post('/resend-otp', [AuthController::class, 'resendOtp']);
+
     Route::middleware('auth:sanctum')->group(function () {
         Route::post('/logout', [AuthController::class, 'logout']);
         Route::delete('/me', [AuthController::class, 'deleteAccount']);
