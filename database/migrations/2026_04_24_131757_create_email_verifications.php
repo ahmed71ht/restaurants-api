@@ -11,11 +11,13 @@ return new class extends Migration
      */
     public function up(): void
     {
-        Schema::create('ip_whitelists', function (Blueprint $table) {
+        Schema::create('email_verifications', function (Blueprint $table) {
             $table->id();
-            $table->string('ip_address')->unique();
+            $table->string('email');
+            $table->string('code');
+            $table->json('payload'); // بيانات المستخدم المؤقتة
+            $table->timestamp('expires_at');
             $table->timestamps();
-            $table->index('ip_address');
         });
     }
 
@@ -24,6 +26,6 @@ return new class extends Migration
      */
     public function down(): void
     {
-        Schema::dropIfExists('ip_whitelist');
+        Schema::dropIfExists('email_verifications');
     }
 };

@@ -1,3 +1,43 @@
+user_ip_logs
+id	user_id	ip_address	user_agent	action	fingerprint_hash	created_at	updated_at	
+
+
+user_behaviors
+id	user_id	ip_address	fingerprint_hash	login_count	failed_logins	last_login	created_at	updated_at	
+
+
+users
+id	name	email	email_verified_at	password	remember_token	created_at	updated_at	role	address	risk_score	is_suspicious	is_blocked	
+
+
+settings
+id	key	value	created_at	updated_at
+
+
+sessions
+id	user_id	ip_address	user_agent	payload	last_activity	
+
+
+risk_states
+id	key	risk_score	last_seen	last_decay_at	failures	successes	created_at	updated_at	
+
+
+ip_blacklists
+id	ip_address	created_at	updated_at	
+
+
+ip_whitelists
+id	ip_address	created_at	updated_at	
+
+
+browser_fingerprints
+id	fingerprint_hash	fingerprint_data	is_blocked	user_count	created_at	updated_at	
+
+
+
+
+
+
 <?php
 
 namespace App\Http\Controllers\Api\Auth;
@@ -6,17 +46,188 @@ use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use App\Models\User;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Validation\ValidationException;
+
+use App\Models\IpBlacklist;
+use App\Models\IpWhitelist;
+use App\Models\Setting;
+use App\Models\UserIpLog;
+
+use App\Services\SecurityService;
+use App\Services\DeviceFingerprintService;
+use App\Services\BehaviorService;
+use App\Services\RiskEngineService;
+use App\Services\DecisionEngineService;
 
 class AuthController extends Controller
 {
+    private function log($user, $request, $action, $fingerprint = null)
+    {
+        UserIpLog::create([
+            'user_id' => $user->id,
+            'ip_address' => $request->ip(),
+            'user_agent' => $request->userAgent(),
+            'action' => $action,
+            'fingerprint_hash' => $fingerprint['hash'] ?? null,
+        ]);
+    }
+
+    private function rateLimit(Request $request, $deviceHash = null)
+    {
+        $key = 'auth:' . sha1($deviceHash . $request->ip() . sha1($request->userAgent() ?? 'na'));
+
+        if (RateLimiter::tooManyAttempts($key, 5)) {
+            throw ValidationException::withMessages(['error' => 'Too many attempts']);
+        }
+
+        RateLimiter::hit($key, 60);
+    }
+
+    private function checkVpn(Request $request)
+    {
+        $ip = $request->ip();
+        $cacheKey = "vpn:$ip";
+
+        if (cache()->has($cacheKey) && cache($cacheKey) === true) {
+            throw ValidationException::withMessages(['error' => 'VPN detected']);
+        }
+
+        if (IpBlacklist::where('ip_address', $ip)->exists()) {
+            throw ValidationException::withMessages(['error' => 'Access denied']);
+        }
+
+        $apiKey = env('IPHUB_API_KEY');
+        if (!$apiKey) return;
+
+        try {
+            $res = Http::timeout(4)
+                ->withHeaders(['X-Key' => $apiKey])
+                ->get("http://v2.api.iphub.info/ip/$ip");
+
+            if (!$res->successful()) {
+                cache()->put($cacheKey, false, now()->addHour());
+                return;
+            }
+
+            $data = $res->json();
+
+            $score = 0;
+
+            if (($data['block'] ?? 0) == 1) $score += 50;
+            if (($data['proxy'] ?? 0) == 1) $score += 40;
+
+            $org = strtolower($data['org'] ?? '');
+
+            if (str_contains($org, 'vpn')) $score += 30;
+            if (str_contains($org, 'hosting')) $score += 20;
+            if (str_contains($org, 'datacenter')) $score += 20;
+
+            $isVpn = $score >= 50;
+
+            cache()->put($cacheKey, $isVpn, now()->addHours(6));
+
+            if ($isVpn) {
+                IpBlacklist::firstOrCreate(['ip_address' => $ip]);
+                throw ValidationException::withMessages(['error' => 'VPN detected']);
+            }
+
+        } catch (\Throwable $e) {
+            Log::warning($e->getMessage());
+            cache()->put($cacheKey, false, now()->addHour());
+        }
+    }
+
+    // 🔐 SAFE RESPONSE
+    private function safeResponse($user = null)
+    {
+        if (!$user) {
+            return response()->json(['message' => 'OK']);
+        }
+
+        return response()->json([
+            'token' => $user->createToken('auth')->plainTextToken,
+            'user' => $user
+        ]);
+    }
+
     public function register(Request $request)
     {
         $validated = $request->validate([
             'name' => 'required|string|max:255',
-            'email' => 'required|string|email|max:255|unique:users,email',
-            'password' => 'required|string|min:6',
+            'email' => 'required|email|unique:users,email',
+            'password' => 'required|min:6',
         ]);
+
+        $device = (new DeviceFingerprintService())->generateDeviceId($request);
+
+        $this->rateLimit($request, $device['hash']);
+        $this->checkVpn($request);
+
+        // 🔥 whitelist bypass
+        if (IpWhitelist::where('ip_address', $request->ip())->exists()) {
+            $user = User::create([
+                'name' => $validated['name'],
+                'email' => $validated['email'],
+                'password' => Hash::make($validated['password']),
+            ]);
+
+            return $this->safeResponse($user);
+        }
+
+        $recent = User::where('created_at', '>=', now()->subMinutes(3))->count();
+        if ($recent >= 10) {
+            throw ValidationException::withMessages(['error' => 'System busy']);
+        }
+
+        $behavior = new BehaviorService();
+        $behaviorScore = $behavior->analyze($request, $device['hash']);
+
+        $riskEngine = new RiskEngineService();
+        $adaptiveRisk = $riskEngine->getRisk($request, $device['hash']);
+
+        $security = new SecurityService();
+        $baseScore = $security->calculateRisk($request, null);
+
+        $decision = (new DecisionEngineService())
+            ->decide($baseScore, $behaviorScore, $adaptiveRisk);
+
+        // ⛔ BLOCK
+        if ($decision['action'] === 'block') {
+            $riskEngine->addFailure($request, $device['hash']);
+
+            throw ValidationException::withMessages(['error' => 'Access denied']);
+        }
+
+        // ⚠️ CAPTCHA
+        if ($decision['action'] === 'captcha') {
+            return response()->json([
+                'type' => 'captcha',
+                'score' => $decision['score']
+            ]);
+        }
+
+        // ⚠️ OTP
+        if ($decision['action'] === 'otp') {
+            return response()->json([
+                'type' => 'otp',
+                'score' => $decision['score']
+            ]);
+        }
+
+        $uaUsers = UserIpLog::where('user_agent', $request->userAgent())
+            ->where('fingerprint_hash', $device['hash'])
+            ->where('created_at', '>=', now()->subHours(6))
+            ->pluck('user_id')
+            ->unique()
+            ->count();
+
+        if ($uaUsers >= 3) {
+            throw ValidationException::withMessages(['error' => 'Too many accounts']);
+        }
 
         $user = User::create([
             'name' => $validated['name'],
@@ -24,336 +235,376 @@ class AuthController extends Controller
             'password' => Hash::make($validated['password']),
         ]);
 
-        $token = $user->createToken('auth_token')->plainTextToken;
+        $user->sendEmailVerificationNotification();
+
+        $riskEngine->addSuccess($request, $device['hash']);
+        $security->applyResult($user, $decision['score']);
+
+        $this->log($user, $request, 'register', $device);
 
         return response()->json([
-            'message' => 'تم إنشاء الحساب',
-            'token' => $token,
-            'user' => $user
-        ], 201);
+            'message' => 'Account created. Please verify email.'
+        ]);
     }
 
     public function login(Request $request)
     {
         $validated = $request->validate([
             'email' => 'required|email',
-            'password' => 'required|string'
+            'password' => 'required'
         ]);
 
-        $user = User::where('email', $validated['email'])->first();
+        $device = (new DeviceFingerprintService())->generateDeviceId($request);
 
-        $key = 'login:' . $request->ip();
+        $this->rateLimit($request, $device['hash']);
+        $this->checkVpn($request);
 
-        if (RateLimiter::tooManyAttempts($key, 5)) {
-            return response()->json([
-                'message' => 'تم حظر المحاولات مؤقتاً'
-            ], 429);
+        if (IpWhitelist::where('ip_address', $request->ip())->exists()) {
+            if (!Auth::attempt($validated)) {
+                throw ValidationException::withMessages(['error' => 'Invalid credentials']);
+            }
+
+            return $this->safeResponse(Auth::user());
         }
 
-        if (!$user || !Hash::check($validated['password'], $user->password)) {
-            RateLimiter::hit($key, 60);
+        if (!Auth::attempt($validated)) {
+            (new RiskEngineService())->addFailure($request, $device['hash']);
 
-            return response()->json([
-                'message' => 'بيانات غير صحيحة'
-            ], 401);
+            throw ValidationException::withMessages(['error' => 'Invalid credentials']);
         }
 
-        RateLimiter::clear($key);
+        $user = Auth::user();
 
-        // ✅ FIX
-        $user->tokens()->delete();
+        $behavior = new BehaviorService();
+        $behaviorScore = $behavior->analyze($request, $device['hash'], $user);
 
-        $token = $user->createToken('auth_token')->plainTextToken;
+        $riskEngine = new RiskEngineService();
+        $adaptiveRisk = $riskEngine->getRisk($request, $device['hash']);
 
-        return response()->json([
-            'message' => 'تم تسجيل الدخول',
-            'token' => $token,
-            'user' => $user
-        ]);
+        $security = new SecurityService();
+        $baseScore = $security->calculateRisk($request, $user);
+
+        $decision = (new DecisionEngineService())
+            ->decide($baseScore, $behaviorScore, $adaptiveRisk);
+
+        if ($decision['action'] === 'block') {
+            Auth::logout();
+            $riskEngine->addFailure($request, $device['hash']);
+            throw ValidationException::withMessages(['error' => 'Blocked']);
+        }
+
+        if ($decision['action'] === 'captcha') {
+            return response()->json(['type' => 'captcha']);
+        }
+
+        if ($decision['action'] === 'otp') {
+            return response()->json(['type' => 'otp']);
+        }
+
+        $security->applyResult($user, $decision['score']);
+        $riskEngine->addSuccess($request, $device['hash']);
+
+        $this->log($user, $request, 'login', $device);
+
+        return $this->safeResponse($user);
     }
 
     public function logout(Request $request)
     {
-        $request->user()?->currentAccessToken()?->delete();
+        $request->user()->currentAccessToken()->delete();
 
-        return response()->json([
-            'message' => 'تم تسجيل الخروج'
-        ]);
-    }
-
-    public function deleteAccount(Request $request)
-    {
-        $user = $request->user();
-
-        $user->tokens()->delete();
-        $user->delete();
-
-        return response()->json([
-            'message' => 'تم حذف الحساب'
-        ]);
+        return response()->json(['message' => 'Logged out']);
     }
 }
 
-______________________
+
+
+
+-----------------------------------------------------------------
 
 <?php
 
-namespace App\Http\Controllers\Api;
+namespace App\Services;
 
-use App\Http\Controllers\Controller;
-use App\Models\Restaurant;
-use App\Models\Food;
-use App\Models\User;
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Hash;
+use App\Models\UserIpLog;
+use App\Models\IpBlacklist;
 
-class AdminController extends Controller
+class BehaviorService
 {
-    public function dashboard()
+    public function analyze($request, $fingerprintHash = null, $user = null)
     {
-        $restaurantsCount = Restaurant::count();
-        $foodsCount = Food::count();
+        $ip = $request->ip();
+        $score = 0;
 
-        $latestRestaurants = Restaurant::latest()->take(10)->get();
-        $latestFoods = Food::with('restaurant')->latest()->take(10)->get();
+        $recent = UserIpLog::where('ip_address', $ip)
+            ->where('created_at', '>=', now()->subMinutes(10))
+            ->count();
 
-        $foodsPerRestaurantRaw = DB::table('foods')
-            ->select('restaurant_id', DB::raw('count(*) as total'))
-            ->groupBy('restaurant_id')
-            ->orderByDesc('total')
-            ->take(10)
-            ->get();
+        if ($recent >= 5) {
+            $score += 30;
+        }
 
-        $restaurants = Restaurant::whereIn(
-            'id',
-            $foodsPerRestaurantRaw->pluck('restaurant_id')
-        )->get()->keyBy('id');
+        if ($user) {
+            $deviceCount = UserIpLog::where('user_id', $user->id)
+                ->distinct('fingerprint_hash')
+                ->count('fingerprint_hash');
 
-        $foodsPerRestaurant = $foodsPerRestaurantRaw->map(function ($row) use ($restaurants) {
+            if ($deviceCount > 4) {
+                $score += 25;
+            }
+        }
+
+        if (IpBlacklist::where('ip_address', $ip)->exists()) {
+            $score += 50;
+        }
+
+        return min($score, 100);
+    }
+}
+
+-----------------------------------------------------------
+
+<?php
+
+namespace App\Services;
+
+class DecisionEngineService
+{
+    public function decide($securityScore, $behaviorScore, $adaptiveRisk)
+    {
+        $score = min(($securityScore * 0.5) + ($behaviorScore * 0.3) + ($adaptiveRisk * 0.2), 100);
+
+        if ($score >= 85) {
             return [
-                'restaurant_name' => $restaurants[$row->restaurant_id]->name ?? 'غير معروف',
-                'total' => $row->total,
+                'action' => 'block',
+                'score' => $score
             ];
-        });
+        }
 
-        return response()->json([
-            'restaurants_count' => $restaurantsCount,
-            'foods_count' => $foodsCount,
-            'latest_restaurants' => $latestRestaurants,
-            'latest_foods' => $latestFoods,
-            'foods_per_restaurant' => $foodsPerRestaurant,
-        ]);
-    }
+        if ($score >= 60) {
+            return [
+                'action' => 'challenge',
+                'score' => $score
+            ];
+        }
 
-    public function users()
-    {
-        return response()->json([
-            'users' => User::paginate(20)
-        ]);
-    }
-
-    public function updateUser(Request $request, $id)
-    {
-        $user = User::findOrFail($id);
-
-        $request->validate([
-            'name' => 'required|string',
-            'email' => 'required|email|unique:users,email,' . $id,
-            'role' => 'nullable|string',
-            'password' => 'nullable|min:6',
-        ]);
-
-        $user->update([
-            'name' => $request->name,
-            'email' => $request->email,
-            'role' => $request->role,
-            'password' => $request->password ? Hash::make($request->password) : $user->password,
-        ]);
-
-        return response()->json([
-            'message' => 'تم التحديث',
-            'user' => $user
-        ]);
+        return [
+            'action' => 'allow',
+            'score' => $score
+        ];
     }
 }
 
-______________________
+
+
+
+
+-------------------------------------------------------
+
 
 <?php
 
-namespace App\Http\Controllers\Api;
+namespace App\Services;
 
-use App\Http\Controllers\Controller;
-use App\Models\CommentReply;
 use Illuminate\Http\Request;
 
-class CommentReplyController extends Controller
+class DeviceFingerprintService
 {
-    /**
-     * Store reply
-     */
-    public function store(Request $request, \App\Models\RestaurantComment $comment)
+    public function generateDeviceId(Request $request)
     {
-        $request->validate([
-            'reply' => 'required|min:3',
-        ]);
+        $ip = $request->ip();
 
-        $reply = CommentReply::create([
-            'user_id'    => $request->user()->id,
-            'comment_id' => $comment->id,
-            'reply'      => $request->reply,
-        ]);
+        $data = [
+            'ua' => $request->userAgent(),
+            'lang' => $request->header('Accept-Language'),
+            'platform' => $request->header('Sec-CH-UA-Platform') ?? 'unknown',
+            'screen' => $request->header('X-Screen-Res') ?? 'unknown',
+            'timezone' => $request->header('X-Timezone') ?? 'unknown',
+            'encoding' => $request->header('Accept-Encoding'),
+            'ip_subnet' => $this->subnet($ip),
+        ];
 
-        return response()->json([
-            'message' => 'تم إضافة الرد بنجاح',
-            'reply' => $reply
-        ]);
+        ksort($data);
+
+        return [
+            'hash' => hash('sha256', json_encode($data)),
+            'data' => $data
+        ];
     }
 
-    /**
-     * Update reply
-     */
-    public function update(Request $request, $id)
+    private function subnet($ip)
     {
-        $request->validate([
-            'reply' => 'required|min:3',
-        ]);
-
-        $reply = CommentReply::findOrFail($id);
-
-        // فقط صاحب الرد
-        if ($reply->user_id !== $request->user()->id) {
-            return response()->json([
-                'message' => 'غير مسموح'
-            ], 403);
-        }
-
-        $reply->update([
-            'reply' => $request->reply
-        ]);
-
-        return response()->json([
-            'message' => 'تم تعديل الرد بنجاح',
-            'reply' => $reply
-        ]);
-    }
-
-    /**
-     * Delete reply
-     */
-    public function destroy(Request $request, $id)
-    {
-        $reply = CommentReply::findOrFail($id);
-
-        $user = $request->user();
-
-        $restaurantOwnerId = optional($reply->comment?->restaurant)->owner_id;
-
-        if (
-            $reply->user_id !== $user->id &&
-            $user->role !== 'admin' &&
-            $user->id !== $restaurantOwnerId
-        ) {
-            return response()->json([
-                'message' => 'غير مسموح بحذف الرد'
-            ], 403);
-        }
-
-        $reply->delete();
-
-        return response()->json([
-            'message' => 'تم حذف الرد'
-        ]);
+        return $ip ? substr($ip, 0, strrpos($ip, '.')) : null;
     }
 }
 
-______________________
+-----------------------------------------------------------------------
 
 <?php
 
-namespace App\Http\Controllers\Api;
+namespace App\Services;
 
-use App\Http\Controllers\Controller;
-use App\Models\Order;
-use App\Models\Restaurant;
+use App\Models\RiskState;
 use Illuminate\Http\Request;
 
-class DeliveryController extends Controller
+class RiskEngineService
 {
-    /**
-     * Get delivery orders for restaurant
-     */
-    public function index(Restaurant $restaurant)
+    private function getKey(Request $request, $fingerprintHash = null)
     {
-        $orders = $restaurant->orders()
-            ->with(['foods', 'customer'])
-            ->where('status', 'accepted')
-            ->whereNotNull('delivery_status')
-            ->latest()
-            ->get();
+        $ipKey = 'ip:' . $request->ip();
+        $fpKey = $fingerprintHash ? 'fp:' . $fingerprintHash : null;
 
-        return response()->json([
-            'restaurant' => $restaurant,
-            'orders' => $orders
-        ]);
+        return [$ipKey, $fpKey];
     }
 
-    /**
-     * Update delivery status
-     */
-    public function updateStatus(Request $request, Restaurant $restaurant, Order $order)
+    private function getState($key)
     {
-        $user = $request->user();
-
-        if (!$user || ($user->role !== 'admin' && $user->id !== $restaurant->delivery_id)) {
-            return response()->json([
-                'message' => 'ليس لديك صلاحية'
-            ], 403);
-        }
-
-        if ($order->restaurant_id !== $restaurant->id) {
-            return response()->json([
-                'message' => 'الطلب غير تابع لهذا المطعم'
-            ], 404);
-        }
-
-        $request->validate([
-            'delivery_status' => 'required|in:pending_delivery,on_the_way,delivered'
-        ]);
-
-        $order->update([
-            'delivery_status' => $request->delivery_status
-        ]);
-
-        return response()->json([
-            'message' => 'تم تحديث حالة التوصيل',
-            'order' => $order
-        ]);
+        return RiskState::firstOrCreate(
+            ['key' => $key],
+            [
+                'risk_score' => 0,
+                'failures' => 0,
+                'successes' => 0
+            ]
+        );
     }
 
-    /**
-     * Delete delivered orders
-     */
-    public function deleteDelivered(Request $request)
+    // 🔥 تسجيل فشل (محاولة مشبوهة)
+    public function addFailure(Request $request, $fingerprintHash = null)
     {
-        $user = $request->user();
+        foreach ($this->getKey($request, $fingerprintHash) as $key) {
+            if (!$key) continue;
 
-        // فقط الادمن
-        if (!$user || $user->role !== 'admin') {
-            return response()->json([
-                'message' => 'غير مصرح'
-            ], 403);
+            $state = $this->getState($key);
+
+            $state->failures += 1;
+            $state->risk_score += 15;
+
+            $state->last_seen = now();
+            $state->save();
+        }
+    }
+
+    // ✅ تسجيل نجاح (سلوك طبيعي)
+    public function addSuccess(Request $request, $fingerprintHash = null)
+    {
+        foreach ($this->getKey($request, $fingerprintHash) as $key) {
+            if (!$key) continue;
+
+            $state = $this->getState($key);
+
+            $state->successes += 1;
+
+            // تقليل الخطورة تدريجيًا
+            $state->risk_score -= 5;
+
+            if ($state->risk_score < 0) {
+                $state->risk_score = 0;
+            }
+
+            $state->last_seen = now();
+            $state->save();
+        }
+    }
+
+    // 🔥 جلب الخطورة الحالية
+    public function getRisk(Request $request, $fingerprintHash = null)
+    {
+        $maxRisk = 0;
+
+        foreach ($this->getKey($request, $fingerprintHash) as $key) {
+            if (!$key) continue;
+
+            $state = $this->getState($key);
+
+            $maxRisk = max($maxRisk, $state->risk_score);
         }
 
-        $deleted = Order::where('delivery_status', 'delivered')->delete();
+        return min($maxRisk, 100);
+    }
 
-        return response()->json([
-            'message' => 'تم حذف الطلبات الموصلة',
-            'deleted_count' => $deleted
-        ], 200);
+    public function decay($state)
+    {
+        if (!$state->last_seen) return;
+
+        $hours = now()->diffInHours($state->last_seen);
+
+        // كل 6 ساعات نزّل risk شوي
+        $decaySteps = intdiv($hours, 6);
+
+        if ($decaySteps > 0) {
+            $state->risk_score -= $decaySteps * 5;
+
+            if ($state->risk_score < 0) {
+                $state->risk_score = 0;
+            }
+
+            $state->last_decay_at = now();
+            $state->save();
+        }
     }
 }
 
-______________________
 
+----------------------------------------------------------------------------------------------------
+
+<?php
+
+namespace App\Services;
+
+use App\Models\User;
+use App\Models\UserIpLog;
+use App\Models\IpBlacklist;
+
+class SecurityService
+{
+    public function calculateRisk($request, $user = null)
+    {
+        $score = 0;
+        $ip = $request->ip();
+
+        if (IpBlacklist::where('ip_address', $ip)->exists()) {
+            $score += 50;
+        }
+
+        $ipSpam = UserIpLog::where('ip_address', $ip)
+            ->where('created_at', '>=', now()->subMinutes(15))
+            ->count();
+
+        $score += min($ipSpam * 8, 30);
+
+        if ($user) {
+
+            $deviceCount = UserIpLog::where('user_id', $user->id)
+                ->distinct('fingerprint_hash')
+                ->count('fingerprint_hash');
+
+            if ($deviceCount > 3) {
+                $score += 20;
+            }
+
+            $last = UserIpLog::where('user_id', $user->id)->latest()->first();
+
+            if ($last && $last->user_agent !== $request->userAgent()) {
+                $score += 15;
+            }
+        }
+
+        return min($score, 100);
+    }
+
+    public function applyResult(User $user, $score)
+    {
+        $user->risk_score = $score;
+        $user->is_suspicious = false;
+        $user->is_blocked = false;
+
+        if ($score >= 85) {
+            $user->is_blocked = true;
+        } elseif ($score >= 60) {
+            $user->is_suspicious = true;
+        }
+
+        $user->save();
+    }
+}

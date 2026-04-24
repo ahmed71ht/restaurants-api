@@ -6,188 +6,287 @@ use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use App\Models\User;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Auth;
-use App\Models\BrowserFingerprint;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Validation\ValidationException;
+use Illuminate\Support\Facades\Mail;
+
 use App\Models\IpBlacklist;
 use App\Models\IpWhitelist;
 use App\Models\Setting;
-use App\Services\DeviceFingerprintService;
-use Illuminate\Validation\ValidationException;
-use Illuminate\Support\Facades\Log;
+use App\Models\UserIpLog;
+use App\Models\EmailVerification;
 
+use App\Services\SecurityService;
+use App\Services\DeviceFingerprintService;
+use App\Services\BehaviorService;
+use App\Services\RiskEngineService;
+use App\Services\DecisionEngineService;
+
+use App\Mail\VerifyEmailOtp;
 
 class AuthController extends Controller
 {
-    protected function logUserIp($user, $request, $action, $fingerprintData = null)
+    private function log($user, $request, $action, $fingerprint = null)
     {
-        $ipAddress = $request->ip();
-        $userAgent = $request->header('User-Agent');
-        $fingerprintHash = $fingerprintData['hash'] ?? null;
-
-        \App\Models\UserIpLog::create([
+        UserIpLog::create([
             'user_id' => $user->id,
-            'ip_address' => $ipAddress,
-            'user_agent' => $userAgent,
+            'ip_address' => $request->ip(),
+            'user_agent' => $request->userAgent(),
             'action' => $action,
-            'fingerprint_hash' => $fingerprintHash,
+            'fingerprint_hash' => $fingerprint['hash'] ?? null,
         ]);
     }
 
+    private function rateLimit(Request $request, $deviceHash = null)
+    {
+        $key = 'auth:' . sha1($deviceHash . $request->ip() . sha1($request->userAgent() ?? 'na'));
+
+        if (RateLimiter::tooManyAttempts($key, 5)) {
+            throw ValidationException::withMessages(['error' => 'Too many attempts']);
+        }
+
+        RateLimiter::hit($key, 60);
+    }
+
+    private function checkVpn(Request $request)
+    {
+        $ip = $request->ip();
+        $cacheKey = "vpn:$ip";
+
+        if (cache()->has($cacheKey) && cache($cacheKey) === true) {
+            throw ValidationException::withMessages(['error' => 'VPN detected']);
+        }
+
+        if (IpBlacklist::where('ip_address', $ip)->exists()) {
+            throw ValidationException::withMessages(['error' => 'Access denied']);
+        }
+
+        $apiKey = env('IPHUB_API_KEY');
+        if (!$apiKey) return;
+
+        try {
+            $res = Http::timeout(4)
+                ->withHeaders(['X-Key' => $apiKey])
+                ->get("http://v2.api.iphub.info/ip/$ip");
+
+            if (!$res->successful()) {
+                cache()->put($cacheKey, false, now()->addHour());
+                return;
+            }
+
+            $data = $res->json();
+
+            $score = 0;
+            if (($data['block'] ?? 0) == 1) $score += 50;
+            if (($data['proxy'] ?? 0) == 1) $score += 40;
+
+            $org = strtolower($data['org'] ?? '');
+            if (str_contains($org, 'vpn')) $score += 30;
+            if (str_contains($org, 'hosting')) $score += 20;
+            if (str_contains($org, 'datacenter')) $score += 20;
+
+            $isVpn = $score >= 50;
+
+            cache()->put($cacheKey, $isVpn, now()->addHours(6));
+
+            if ($isVpn) {
+                IpBlacklist::firstOrCreate(['ip_address' => $ip]);
+                throw ValidationException::withMessages(['error' => 'VPN detected']);
+            }
+
+        } catch (\Throwable $e) {
+            Log::warning($e->getMessage());
+            cache()->put($cacheKey, false, now()->addHour());
+        }
+    }
+
+    private function safeResponse($user = null)
+    {
+        if (!$user) {
+            return response()->json(['message' => 'OK']);
+        }
+
+        return response()->json([
+            'token' => $user->createToken('auth')->plainTextToken,
+            'user' => $user
+        ]);
+    }
+
+    // ================= REGISTER =================
     public function register(Request $request)
     {
         $validated = $request->validate([
-            'name' => ['required','string','max:255'],
-            'email' => ['required','email','max:255','unique:users,email'],
-            'password' => ['required','string','min:6'],
+            'name' => 'required|string|max:255',
+            'email' => 'required|email|unique:users,email',
+            'password' => 'required|min:6',
         ]);
 
-        $deviceService = new DeviceFingerprintService();
-        $fingerprint = $deviceService->generateDeviceId($request);
-        $hash = $fingerprint['hash'];
-        $data = $fingerprint['data'];
+        $device = (new DeviceFingerprintService())->generateDeviceId($request);
 
-        // تحقق من max accounts per device
-        $maxAccounts = Setting::where('key','max_accounts_per_device')->value('value') ?? 0;
-        $existingDevice = BrowserFingerprint::where('fingerprint_hash', $hash)->first();
+        $this->rateLimit($request, $device['hash']);
+        $this->checkVpn($request);
 
-        if($existingDevice && $maxAccounts > 0 && $existingDevice->user_count >= $maxAccounts){
-            throw ValidationException::withMessages([
-                'error' => "تم الوصول للحد الأقصى للحسابات على هذا الجهاز."
-            ]);
+        // منع السبام
+        $otpKey = 'otp:' . sha1($validated['email'] . $request->ip());
+        if (RateLimiter::tooManyAttempts($otpKey, 3)) {
+            throw ValidationException::withMessages(['error' => 'Too many OTP requests']);
         }
 
-        // التحقق من VPN / IP blacklist
-        $ip = $request->ip();
-        $vpnEnabled = Setting::where('key','vpn_detection_enabled')->value('value') == 1;
+        RateLimiter::hit($otpKey, 120);
 
-    if($vpnEnabled){
-        // 1. تحقق القائمة السوداء أولاً
-        if(IpBlacklist::where('ip_address', $ip)->exists()){
-            throw ValidationException::withMessages([
-                'error' => "تم حظر هذا IP."
-            ]);
-        }
+        $code = (string) random_int(100000, 999999);
 
-        // 2. تحقق القائمة البيضاء
-        if(IpWhitelist::where('ip_address', $ip)->exists()){
-            $vpnDetected = false; // IP مو VPN
-        } else {
-            $apiKey = env('IPHUB_API_KEY');
-            if(empty($apiKey)){
-                $vpnDetected = false; // نتخطى VPN
-            } else {
-                try{
-                    $response = Http::withHeaders([
-                        'X-Key' => $apiKey
-                    ])->get("http://v2.api.iphub.info/ip/".$ip);
+        // نحذف القديم
+        EmailVerification::where('email', $validated['email'])->delete();
 
-                    $apiData = $response->json();
-
-                    if(isset($apiData["block"]) && $apiData["block"] == 1){
-                        // VPN مكتشف → أضف للقائمة السوداء
-                        IpBlacklist::create(['ip_address' => $ip]);
-                        throw ValidationException::withMessages([
-                            'error' => "تم الكشف عن VPN/Proxy. التسجيل مرفوض."
-                        ]);
-                    } else {
-                        // IP مو VPN → أضف للقائمة البيضاء
-                        IpWhitelist::create(['ip_address' => $ip]);
-                    }
-
-                }catch(\Exception $e){
-                    // خطأ بالـ API → نتخطى
-                    Log::error("VPN API error: ".$e->getMessage());
-                    $vpnDetected = false;
-                }
-            }
-        }
-    }
-
-        // إنشاء المستخدم
-        $user = User::create([
-            'name' => $validated['name'],
+        EmailVerification::create([
             'email' => $validated['email'],
-            'password' => Hash::make($validated['password']),
-            'browser_fingerprint' => $hash,
-            'fingerprint_data' => $data
+            'code' => $code, // 🔥 بدون Hash
+            'payload' => $validated,
+            'expires_at' => now()->addMinutes(10),
+            'attempts' => 0
         ]);
 
-        $this->logUserIp($user, $request, 'register', $fingerprint);
-
-        // تسجيل الجهاز
-        $deviceService->registerDeviceId($hash, $data, $user->id);
-
-        $token = $user->createToken($request->userAgent() ?? 'auth_token')->plainTextToken;
+        Mail::to($validated['email'])->send(new VerifyEmailOtp($code));
 
         return response()->json([
-            'message' => 'تم إنشاء الحساب',
-            'token' => $token,
-            'user' => $user
-        ], 201);
+            'type' => 'otp',
+            'message' => 'Verification code sent'
+        ]);
     }
 
+    // ================= VERIFY OTP =================
+    public function verifyOtp(Request $request)
+    {
+        $request->validate([
+            'email' => 'required|email',
+            'code'  => 'required'
+        ]);
+
+        $record = EmailVerification::where('email', $request->email)
+            ->latest()
+            ->first();
+
+        if (!$record) {
+            throw ValidationException::withMessages(['error' => 'Code not found']);
+        }
+
+        if (now()->greaterThan($record->expires_at)) {
+            $record->delete();
+            throw ValidationException::withMessages(['error' => 'Code expired']);
+        }
+
+        // 🔥 تنظيف الكود
+        $inputCode = preg_replace('/\s+/', '', (string) $request->code);
+
+        if ($inputCode !== $record->code) {
+            $record->increment('attempts');
+
+            throw ValidationException::withMessages([
+                'error' => 'Invalid code'
+            ]);
+        }
+
+        $data = $record->payload;
+
+        $user = User::create([
+            'name' => $data['name'],
+            'email' => $data['email'],
+            'password' => Hash::make($data['password']),
+        ]);
+
+        $record->delete();
+
+        return response()->json([
+            'token' => $user->createToken('auth')->plainTextToken,
+            'user'  => $user
+        ]);
+    }
+    // ================= RESEND OTP =================
+    public function resendOtp(Request $request)
+    {
+        $request->validate(['email' => 'required|email']);
+
+        $record = EmailVerification::where('email', $request->email)->latest()->first();
+
+        if (!$record) {
+            throw ValidationException::withMessages(['error' => 'No OTP found']);
+        }
+
+        if ($record->updated_at->gt(now()->subSeconds(60))) {
+            throw ValidationException::withMessages(['error' => 'Wait before retry']);
+        }
+
+        $code = (string) random_int(100000, 999999);
+
+        $record->update([
+            'code' => $code,
+            'expires_at' => now()->addMinutes(10),
+            'attempts' => 0
+        ]);
+
+        Mail::to($request->email)->send(new VerifyEmailOtp($code));
+
+        return response()->json([
+            'message' => 'OTP resent'
+        ]);
+    }
+
+    // ================= LOGIN =================
     public function login(Request $request)
     {
         $validated = $request->validate([
-            'email' => ['required','email'],
-            'password' => ['required','string']
+            'email' => 'required|email',
+            'password' => 'required'
         ]);
 
-        $key = 'login:' . $request->ip() . '|' . $validated['email'];
+        $device = (new DeviceFingerprintService())->generateDeviceId($request);
 
-        // إذا حاول المستخدم أكثر من 5 مرات خلال دقيقة واحدة
-        if(RateLimiter::tooManyAttempts($key, 5)){
-            return response()->json([
-                'message' => 'عدد محاولات الدخول كبير جدًا. حاول لاحقًا.'
-            ], 429);
+        $this->rateLimit($request, $device['hash']);
+        $this->checkVpn($request);
+
+        if (!Auth::attempt($validated)) {
+            (new RiskEngineService())->addFailure($request, $device['hash']);
+            throw ValidationException::withMessages(['error' => 'Invalid credentials']);
         }
-
-        if(!Auth::attempt($validated)){
-            RateLimiter::hit($key, 60); // hit لمدة 60 ثانية
-            return response()->json([
-                'message' => 'بيانات الدخول غير صحيحة'
-            ], 401);
-        }
-
-        RateLimiter::clear($key); // إزالة عد المحاولات بعد تسجيل الدخول بنجاح
 
         $user = Auth::user();
 
-        // تسجيل الدخول متعدد الأجهزة → إنشاء Token جديد لكل جهاز
-        $token = $user->createToken($request->userAgent() ?? 'auth_token')->plainTextToken;
+        $behaviorScore = (new BehaviorService())->analyze($request, $device['hash'], $user);
+        $adaptiveRisk = (new RiskEngineService())->getRisk($request, $device['hash']);
+        $baseScore = (new SecurityService())->calculateRisk($request, $user);
 
-        // تسجيل IP
-        $this->logUserIp($user, $request, 'login');
+        $decision = (new DecisionEngineService())
+            ->decide($baseScore, $behaviorScore, $adaptiveRisk);
 
-        return response()->json([
-            'token' => $token,
-            'user' => $user
-        ]);
+        if ($decision['action'] === 'block') {
+            Auth::logout();
+            (new RiskEngineService())->addFailure($request, $device['hash']);
+            throw ValidationException::withMessages(['error' => 'Blocked']);
+        }
+
+        if ($decision['action'] === 'captcha') {
+            return response()->json(['type' => 'captcha']);
+        }
+
+        if ($decision['action'] === 'otp') {
+            return response()->json(['type' => 'otp']);
+        }
+
+        (new SecurityService())->applyResult($user, $decision['score']);
+        (new RiskEngineService())->addSuccess($request, $device['hash']);
+
+        $this->log($user, $request, 'login', $device);
+
+        return $this->safeResponse($user);
     }
 
-    // تسجيل الخروج من الجهاز الحالي
     public function logout(Request $request)
     {
-        $request->user()?->currentAccessToken()?->delete();
-        return response()->json(['message' => 'تم تسجيل الخروج']);
-    }
-
-    // تسجيل الخروج من جميع الأجهزة
-    public function logoutAll(Request $request)
-    {
-        $request->user()->tokens()->delete();
-        return response()->json(['message' => 'تم تسجيل الخروج من جميع الأجهزة']);
-    }
-
-    public function deleteAccount(Request $request)
-    {
-        $user = $request->user();
-
-        // حذف جميع Tokens
-        $user->tokens()->delete();
-        $user->delete();
-
-        return response()->json(['message' => 'تم حذف الحساب']);
+        $request->user()->currentAccessToken()->delete();
+        return response()->json(['message' => 'Logged out']);
     }
 }

@@ -3,36 +3,33 @@
 namespace App\Services;
 
 use Illuminate\Http\Request;
-use App\Models\BrowserFingerprint;
 
 class DeviceFingerprintService
 {
     public function generateDeviceId(Request $request)
     {
-        $fingerprintData = [
-            'ip_address' => $request->ip(),
-            'user_agent' => $request->header('User-Agent'),
-            'accept_language' => $request->header('Accept-Language')
+        $ip = $request->ip();
+
+        $data = [
+            'ua' => $request->userAgent(),
+            'lang' => $request->header('Accept-Language'),
+            'platform' => $request->header('Sec-CH-UA-Platform') ?? 'unknown',
+            'screen' => $request->header('X-Screen-Res') ?? 'unknown',
+            'timezone' => $request->header('X-Timezone') ?? 'unknown',
+            'encoding' => $request->header('Accept-Encoding'),
+            'ip_subnet' => $this->subnet($ip),
         ];
 
-        $hash = hash('sha256', json_encode($fingerprintData));
+        ksort($data);
 
         return [
-            'hash' => $hash,
-            'data' => $fingerprintData
+            'hash' => hash('sha256', json_encode($data)),
+            'data' => $data
         ];
     }
 
-    public function registerDeviceId($hash, $data, $userId)
+    private function subnet($ip)
     {
-        $fingerprint = BrowserFingerprint::firstOrCreate(
-            ['fingerprint_hash' => $hash],
-            ['fingerprint_data' => $data]
-        );
-
-        $fingerprint->user_count += 1;
-        $fingerprint->save();
-
-        return $fingerprint;
+        return $ip ? substr($ip, 0, strrpos($ip, '.')) : null;
     }
 }

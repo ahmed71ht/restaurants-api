@@ -18,6 +18,7 @@ return new class extends Migration
             $table->boolean('is_blocked')->default(false);
             $table->integer('user_count')->default(0);
             $table->timestamps();
+            $table->index('fingerprint_hash');
         });
     }
 
