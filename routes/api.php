@@ -2,7 +2,6 @@
 
 use Illuminate\Support\Facades\Route;
 
-use App\Http\Controllers\Api\Auth\AuthController;
 use App\Http\Controllers\Api\ProfileController;
 use App\Http\Controllers\Api\RestaurantController;
 use App\Http\Controllers\Api\FoodController;
@@ -14,6 +13,11 @@ use App\Http\Controllers\Api\FollowController;
 use App\Http\Controllers\Api\DeliveryController;
 use App\Http\Controllers\Api\AdminController;
 
+use App\Http\Controllers\Api\Auth\RegisterController;
+use App\Http\Controllers\Api\Auth\OtpController;
+use App\Http\Controllers\Api\Auth\LoginController;
+use App\Http\Controllers\Api\Auth\LogoutController;
+use App\Http\Controllers\Api\Auth\PasswordController;
 /*
 |--------------------------------------------------------------------------
 | AUTH ROUTES
@@ -22,21 +26,20 @@ use App\Http\Controllers\Api\AdminController;
 
 Route::prefix('auth')->group(function () {
 
-    // register مع rate limit خفيف
-    Route::post('/register', [AuthController::class, 'register'])
-        ->middleware('throttle:10,1');
+    Route::post('/register', [RegisterController::class, 'register']);
 
-    // login حماية ضد brute force
-    Route::post('/login', [AuthController::class, 'login'])
-        ->name('login')
-        ->middleware('throttle:5,1');
+    Route::post('/login', [LoginController::class, 'login']);
 
-    Route::post('/verify-otp', [AuthController::class, 'verifyOtp']);
-    Route::post('/resend-otp', [AuthController::class, 'resendOtp']);
+    Route::prefix('otp')->group(function () {
+        Route::post('/verify', [OtpController::class, 'verify'])->middleware('throttle:5,1');
+        Route::post('/resend', [OtpController::class, 'resend'])->middleware('throttle:5,1');
+    });
 
     Route::middleware('auth:sanctum')->group(function () {
-        Route::post('/logout', [AuthController::class, 'logout']);
-        Route::delete('/me', [AuthController::class, 'deleteAccount']);
+        Route::post('/logout', [LogoutController::class, 'logout']);
+        Route::post('/delete-account/request', [LogoutController::class, 'requestDeleteAccount']);
+        Route::post('/delete-account/confirm', [LogoutController::class, 'confirmDeleteAccount']);
+        Route::post('/change-password', [PasswordController::class, 'change']);
     });
 });
 
